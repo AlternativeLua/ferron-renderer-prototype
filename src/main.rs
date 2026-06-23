@@ -1,3 +1,5 @@
+use renderer_prototype::App;
+
 fn main() {
-    println!("Hello, world!");
+    App::run();
 }
