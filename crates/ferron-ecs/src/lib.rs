@@ -1,29 +1,41 @@
+//! `ferron-ecs` - a small, dependency-free Entity Component System for game engines
+
 // FERRON-ECS
 // AUTHOR: @AlternativeLua
 
 #![forbid(unsafe_code)]
 
 use std::any::{Any, TypeId};
-use std::cell::{Ref, refCell, RefMut};
+use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::marker::PhantomData;
+
 
 //
 // Entities
 //
 
+/// A small, copyable handle to a single entity.
+///
+/// An entity is identified by a slot `index` plus a `generation`. When a slot
+/// is reused by a later entity the generation changes, so a stale handle to a
+/// despawned entity can be detected instead of silently aliasing the new one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Entity {
-    pub id: u32,
+    /// Index of the storage slot this entity occupies.
+    pub index: u32,
+    /// How many times this slot has been reused; bumped on every despawn.
     pub generation: u32,
 }
 
 impl Entity {
+    /// The storage slot this entity occupies.
     #[inline]
     pub fn index(self) -> u32 {
         self.index
     }
 
+    /// The generation stamp, used to tell a live handle from a stale one.
     #[inline]
     pub fn generation(self) -> u32 {
         self.generation
@@ -31,6 +43,7 @@ impl Entity {
 }
 
 // Hands out entity ids and recycles the indices
+#[derive(Default)]
 struct EntityAllocator {
     generations: Vec<u32>,
     alive: Vec<bool>,
@@ -57,12 +70,12 @@ impl EntityAllocator {
     }
 
     fn deallocate(&mut self, entity: Entity) -> bool {
-        if !self.alive(entity) {
+        if !self.is_alive(entity) {
             return false;
         }
 
         let i = entity.index() as usize;
-        self.generations[i] = self.generations[i].wrappind_add(1);
+        self.generations[i] = self.generations[i].wrapping_add(1);
         self.alive[i] = false;
         self.free.push(entity.index);
         true
@@ -80,7 +93,11 @@ impl EntityAllocator {
 
 const SENTINEL: u32 = u32::MAX;
 
-/// Stores on component type. `sparse` maps an entity index to a slot in packed `dense_*` arrays; `dense_entities` let us map back and run the generation check
+/// Dense storage for a single component type `T`.
+///
+/// `sparse` maps an entity index to a slot in the packed `dense_*` arrays, and
+/// `dense_entities` maps back the other way so lookups can run a generation
+/// check. Keeping the values packed means iteration never walks empty holes.
 pub struct SparseSet<T> {
     sparse: Vec<u32>,
     dense_entities: Vec<Entity>,
@@ -171,8 +188,11 @@ impl<T: 'static> AnyStorage for SparseSet<T> {
 // World
 //
 
-/// Container for all the entities, components and resources
-
+/// The container for all entities, their components, and global resources.
+///
+/// Almost everything goes through a `World`: [`spawn`](World::spawn) creates
+/// entities, [`insert`](World::insert) attaches components, and
+/// [`query`](World::query) iterates over them.
 #[derive(Default)]
 pub struct World {
     entities: EntityAllocator,
@@ -181,20 +201,26 @@ pub struct World {
 }
 
 impl World {
+    /// Create an empty world.
     pub fn new() -> Self {
         Self::default()
     }
 
     // --- entity lifecycle -------------------------------------------------
 
+    /// Create a new entity with no components and return its handle.
     pub fn spawn(&mut self) -> Entity {
         self.entities.allocate()
     }
 
+    /// Returns `true` while `entity` refers to a live (not yet despawned) entity.
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.entities.is_alive(entity)
     }
 
+    /// Remove an entity and all of its components.
+    ///
+    /// Returns `false` if the handle was already stale.
     pub fn despawn(&mut self, entity: Entity) -> bool {
         if !self.entities.is_alive(entity) {
             return false;
@@ -205,6 +231,8 @@ impl World {
         self.entities.deallocate(entity)
     }
 
+    /// Attach a component to `entity`, returning the previous value if one was
+    /// already present.
     pub fn insert<T: 'static>(&mut self, entity: Entity, component: T) -> Option<T> {
         let cell = self
             .storages
@@ -218,6 +246,7 @@ impl World {
         set.insert(entity, component)
     }
 
+    /// Detach and return `entity`'s component of type `T`, if it has one.
     pub fn remove<T: 'static>(&mut self, entity: Entity) -> Option<T> {
         let cell = self.storages.get(&TypeId::of::<T>())?;
         let mut guard = cell.borrow_mut();
@@ -228,10 +257,12 @@ impl World {
         set.remove(entity)
     }
 
+    /// Returns `true` if `entity` currently has a component of type `T`.
     pub fn has<T: 'static>(&self, entity: Entity) -> bool {
         self.get::<T>(entity).is_some()
     }
 
+    /// Borrow `entity`'s component of type `T`, if present.
     pub fn get<T: 'static>(&self, entity: Entity) -> Option<Ref<'_, T>> {
         let cell = self.storages.get(&TypeId::of::<T>())?;
         Ref::filter_map(cell.borrow(), |b| {
@@ -243,6 +274,7 @@ impl World {
             .ok()
     }
 
+    /// Mutably borrow `entity`'s component of type `T`, if present.
     pub fn get_mut<T: 'static>(&self, entity: Entity) -> Option<RefMut<'_, T>> {
         let cell = self.storages.get(&TypeId::of::<T>())?;
         RefMut::filter_map(cell.borrow_mut(), |b| {
@@ -254,6 +286,11 @@ impl World {
             .ok()
     }
 
+    /// Iterate over every entity that has all the components in `Q`.
+    ///
+    /// `Q` is a reference or a tuple of references, e.g. `&Position` or
+    /// `(&mut Position, &Velocity)`. Call [`for_each`](QueryRunner::for_each) on
+    /// the returned runner.
     pub fn query<Q: QueryParam>(&self) -> QueryRunner<'_, Q> {
         QueryRunner {
             world: self,
@@ -263,27 +300,38 @@ impl World {
 
     // --- resources --------------------------------------------------------
 
+    /// Store a unique, world-global value of type `R`, replacing any existing one.
     pub fn insert_resource<R: 'static>(&mut self, resource: R) {
         self.resources
             .insert(TypeId::of::<R>(), RefCell::new(Box::new(resource)));
     }
 
+    /// Remove and return the resource of type `R`, if present.
     pub fn remove_resource<R: 'static>(&mut self) -> Option<R> {
         let cell = self.resources.remove(&TypeId::of::<R>())?;
         let boxed = cell.into_inner();
         boxed.downcast::<R>().ok().map(|b| *b)
     }
 
+    /// Borrow the resource of type `R`.
+    ///
+    /// # Panics
+    /// Panics if no resource of type `R` has been inserted.
     pub fn resource<R: 'static>(&self) -> Ref<'_, R> {
         self.get_resource::<R>()
             .expect("resource not found; insert it with `insert_resource` first")
     }
 
+    /// Mutably borrow the resource of type `R`.
+    ///
+    /// # Panics
+    /// Panics if no resource of type `R` has been inserted.
     pub fn resource_mut<R: 'static>(&self) -> RefMut<'_, R> {
         self.get_resource_mut::<R>()
             .expect("resource not found; insert it with `insert_resource` first")
     }
 
+    /// Borrow the resource of type `R`, or `None` if it has not been inserted.
     pub fn get_resource<R: 'static>(&self) -> Option<Ref<'_, R>> {
         let cell = self.resources.get(&TypeId::of::<R>())?;
         Some(Ref::map(cell.borrow(), |b| {
@@ -291,6 +339,7 @@ impl World {
         }))
     }
 
+    /// Mutably borrow the resource of type `R`, or `None` if it is absent.
     pub fn get_resource_mut<R: 'static>(&self) -> Option<RefMut<'_, R>> {
         let cell = self.resources.get(&TypeId::of::<R>())?;
         Some(RefMut::map(cell.borrow_mut(), |b| {
@@ -303,16 +352,26 @@ impl World {
 // Queries
 //
 
+/// A component access pattern that a [`World::query`] can iterate.
+///
+/// Implemented for `&T` (read), `&mut T` (write), and tuples of those, so a
+/// query like `(&mut Position, &Velocity)` matches entities that have both.
 pub trait QueryParam {
+    /// Borrowed handle(s) to the backing storage for the duration of one query.
     type Fetch<'w>;
+    /// What a single matched entity yields, e.g. `&T` or `(&mut A, &B)`.
     type Item<'a>;
 
+    /// Borrow the storage this query needs, or `None` if it isn't present.
     fn init(world: &World) -> Option<Self::Fetch<'_>>;
 
+    /// Number of candidate entities to scan (driven by the first parameter).
     fn len(fetch: &Self::Fetch<'_>) -> usize;
 
+    /// The entity at candidate position `i`.
     fn entity_at(fetch: &Self::Fetch<'_>, i: usize) -> Entity;
 
+    /// Fetch the item for `entity`, or `None` if it lacks one of the components.
     fn get<'a>(fetch: &'a mut Self::Fetch<'_>, entity: Entity) -> Option<Self::Item<'a>>;
 }
 
@@ -409,6 +468,7 @@ pub struct QueryRunner<'w, Q> {
 }
 
 impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
+    /// Call `f` once for every entity that matches the query `Q`.
     pub fn for_each<F>(&self, mut f: F)
     where
         F: FnMut(Entity, Q::Item<'_>),
@@ -425,6 +485,7 @@ impl<'w, Q: QueryParam> QueryRunner<'w, Q> {
         }
     }
 
+    /// Count how many entities match the query, without invoking a callback.
     pub fn count(&self) -> usize {
         let Some(mut fetch) = Q::init(self.world) else {
             return 0;
