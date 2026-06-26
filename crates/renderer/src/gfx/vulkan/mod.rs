@@ -110,7 +110,11 @@ impl RenderBackend for VulkanRenderer {
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
-                    clear_values: vec![Some([0.02, 0.02, 0.03, 1.0].into()), Some(1.0.into())],
+                    clear_values: vec![
+                        Some([0.02, 0.02, 0.03, 1.0].into()),
+                        Some(1.0.into()),
+                        None,
+                    ],
                     ..RenderPassBeginInfo::framebuffer(
                         self.swapchain.framebuffers[image_index as usize].clone(),
                     )

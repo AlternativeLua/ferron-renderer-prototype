@@ -48,21 +48,29 @@ impl ForwardPass {
         let render_pass = vulkano::single_pass_renderpass!(
             device.clone(),
             attachments: {
-                color: {
+                msaa_color: {
                     format: color_format,
-                    samples: 1,
-                    load_op: Clear,
-                    store_op: Store,
-                },
-                depth: {
-                    format: DEPTH_FORMAT,
-                    samples: 1,
+                    samples: 4,
                     load_op: Clear,
                     store_op: DontCare,
                 },
+                depth: {
+                    format: DEPTH_FORMAT,
+                    samples: 4,
+                    load_op: Clear,
+                    store_op: DontCare,
+                },
+
+                color: {
+                    format: color_format,
+                    samples: 1,
+                    load_op: DontCare,
+                    store_op: Store,
+                },
             },
             pass: {
-                color: [color],
+                color: [msaa_color],
+                color_resolve: [color],
                 depth_stencil: {depth},
             },
         )
@@ -209,7 +217,10 @@ fn build_pipeline(device: &Arc<Device>, render_pass: &Arc<RenderPass>) -> Arc<Gr
                 cull_mode: CullMode::Back,
                 ..Default::default()
             }),
-            multisample_state: Some(MultisampleState::default()),
+            multisample_state: Some(MultisampleState {
+                rasterization_samples: vulkano::image::SampleCount::Sample4,
+                ..Default::default()
+            }),
             depth_stencil_state: Some(DepthStencilState {
                 depth: Some(DepthState::simple()),
                 ..Default::default()

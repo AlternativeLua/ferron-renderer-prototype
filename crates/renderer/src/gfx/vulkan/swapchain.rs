@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use vulkano::format::Format;
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage};
+use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage, SampleCount};
 use vulkano::memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
 use vulkano::swapchain::{Surface, Swapchain, SwapchainCreateInfo};
-
 use super::context::VkContext;
 
 pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
@@ -40,7 +39,7 @@ impl SwapchainState {
                 min_image_count: caps.min_image_count.max(2),
                 image_format: format,
                 image_extent: extent,
-                image_usage: ImageUsage::COLOR_ATTACHMENT,
+                image_usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST,
                 composite_alpha,
                 ..Default::default()
             },
@@ -89,6 +88,28 @@ fn build_framebuffers(
     images: &[Arc<Image>],
     extent: [u32; 2],
 ) -> Vec<Arc<Framebuffer>> {
+    let color_format = images[0].format();
+
+    // Scratch multisampled color target. TRANSIENT because it never leaves the GPU
+    // the resolve consumes it, so it's never stored or sampled
+    let msaa_color = ImageView::new_default(
+        Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: color_format,
+                extent: [extent[0], extent[1], 1],
+                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                samples: SampleCount::Sample4,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+
     let depth = ImageView::new_default(
         Image::new(
             memory_allocator.clone(),
@@ -97,6 +118,7 @@ fn build_framebuffers(
                 format: DEPTH_FORMAT,
                 extent: [extent[0], extent[1], 1],
                 usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                samples: SampleCount::Sample4,
                 ..Default::default()
             },
             AllocationCreateInfo::default(),
@@ -112,7 +134,7 @@ fn build_framebuffers(
             Framebuffer::new(
                 render_pass.clone(),
                 FramebufferCreateInfo {
-                    attachments: vec![color, depth.clone()],
+                    attachments: vec![msaa_color.clone(), depth.clone(), color],
                     ..Default::default()
                 },
             )
