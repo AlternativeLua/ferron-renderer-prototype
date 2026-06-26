@@ -17,6 +17,11 @@ use crate::scene::{Camera, CpuMesh, LocalTransform, Spin, Time};
 use crate::systems;
 use ferron_ecs::World;
 
+/// The scene spawns `GRID * GRID` cubes. Set to 1 for a single cube.
+const GRID: i32 = 10;
+/// World-space spacing between adjacent cubes.
+const SPACING: f32 = 2.0;
+
 struct Active {
     window: Arc<Window>,
     renderer: VulkanRenderer,
@@ -87,10 +92,30 @@ impl ApplicationHandler for App {
         // The mesh must be uploaded before we can hand entities a `MeshHandle`.
         let cube = renderer.load_mesh(&CpuMesh::cube());
 
-        let entity = self.world.spawn();
-        self.world.insert(entity, LocalTransform::default());
-        self.world.insert(entity, cube);
-        self.world.insert(entity, Spin::new(Vec3::Y, 1.0));
+        let half = (GRID - 1) as f32 * SPACING * 0.5;
+        for x in 0..GRID {
+            for z in 0..GRID {
+                let mut transform = LocalTransform::default();
+                transform.translation =
+                    Vec3::new(x as f32 * SPACING - half, 0.0, z as f32 * SPACING - half);
+
+                // Vary spin speed a little so the field isn't perfectly uniform.
+                let speed = 0.5 + ((x + z) % 5) as f32 * 0.4;
+
+                let entity = self.world.spawn();
+                self.world.insert(entity, transform);
+                self.world.insert(entity, cube);
+                self.world.insert(entity, Spin::new(Vec3::Y, speed));
+            }
+        }
+
+        // Pull the camera back so the whole field is in frame.
+        let span = GRID as f32 * SPACING;
+        *self.world.resource_mut::<Camera>() = Camera {
+            position: Vec3::new(0.0, span * 0.6, span * 1.1),
+            target: Vec3::ZERO,
+            ..Camera::default()
+        };
 
         self.active = Some(Active { window, renderer });
     }

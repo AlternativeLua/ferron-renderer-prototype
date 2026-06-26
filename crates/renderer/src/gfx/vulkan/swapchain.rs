@@ -5,10 +5,18 @@ use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage, SampleCount};
 use vulkano::memory::allocator::{AllocationCreateInfo, StandardMemoryAllocator};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass};
-use vulkano::swapchain::{Surface, Swapchain, SwapchainCreateInfo};
+use vulkano::swapchain::{PresentMode, Surface, Swapchain, SwapchainCreateInfo};
 use super::context::VkContext;
 
 pub const DEPTH_FORMAT: Format = Format::D32_SFLOAT;
+
+/// Presentation mode — flip this to toggle vsync:
+/// - `Fifo`: vsync ON, capped to refresh, no tearing (always supported).
+/// - `Mailbox`: uncapped, no tearing (not always supported).
+/// - `Immediate`: uncapped, may tear (not always supported).
+///
+/// Falls back to `Fifo` automatically if the surface doesn't support the choice.
+pub const PRESENT_MODE: PresentMode = PresentMode::Fifo;
 
 pub struct SwapchainState {
     pub swapchain: Arc<Swapchain>,
@@ -32,6 +40,20 @@ impl SwapchainState {
 
         let composite_alpha = caps.supported_composite_alpha.into_iter().next().unwrap();
 
+        // Use the requested present mode if the surface supports it, else vsync.
+        let present_mode = device
+            .physical_device()
+            .surface_present_modes(surface, Default::default())
+            .map(|modes| {
+                if modes.into_iter().any(|m| m == PRESENT_MODE) {
+                    PRESENT_MODE
+                } else {
+                    PresentMode::Fifo
+                }
+            })
+            .unwrap_or(PresentMode::Fifo);
+        println!("Present mode: {present_mode:?}");
+
         let (swapchain, images) = Swapchain::new(
             device.clone(),
             surface.clone(),
@@ -40,6 +62,7 @@ impl SwapchainState {
                 image_format: format,
                 image_extent: extent,
                 image_usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST,
+                present_mode,
                 composite_alpha,
                 ..Default::default()
             },
