@@ -20,7 +20,7 @@ use vulkano::sync::GpuFuture;
 use vulkano::sync::{self, future::FenceSignalFuture};
 use vulkano::{Validated, VulkanError};
 
-use crate::scene::{Camera, CpuMesh, MaterialHandle, MeshHandle};
+use crate::scene::{Camera, CpuMesh, MaterialHandle, MeshHandle, SsaoSettings};
 
 use self::context::VkContext;
 use self::forward::{ForwardPass, GpuMesh, GpuMaterial};
@@ -115,7 +115,13 @@ impl RenderBackend for VulkanRenderer {
         self.recreate_swapchain = true;
     }
 
-    fn render(&mut self, items: &[RenderItem], lighting: &SceneLighting, camera: &Camera) {
+    fn render(
+        &mut self,
+        items: &[RenderItem],
+        lighting: &SceneLighting,
+        camera: &Camera,
+        ssao: &SsaoSettings,
+    ) {
         if self.pending_extent[0] == 0 || self.pending_extent[1] == 0 {
             return;
         }
@@ -155,8 +161,18 @@ impl RenderBackend for VulkanRenderer {
         )
         .unwrap();
 
-        self.ssao.record(&mut builder, self, items, camera, self.swapchain.extent);
-        let ao_view = self.ssao.ao_view();
+        // Drive the SSAO tunables from the world resource each frame. When SSAO
+        // is disabled we skip the three passes and bind a 1x1 white AO view, so
+        // the forward shader samples 1.0 (no occlusion) and is otherwise unchanged.
+        self.ssao.radius = ssao.radius;
+        self.ssao.bias = ssao.bias;
+        self.ssao.power = ssao.power;
+        let ao_view = if ssao.enabled {
+            self.ssao.record(&mut builder, self, items, camera, self.swapchain.extent);
+            self.ssao.ao_view()
+        } else {
+            self.ssao.white_view()
+        };
 
         builder
             .begin_render_pass(

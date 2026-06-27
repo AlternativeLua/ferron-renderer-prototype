@@ -13,7 +13,9 @@ use winit::window::{Window, WindowId};
 
 use crate::gfx::vulkan::VulkanRenderer;
 use crate::gfx::{Material, RenderBackend};
-use crate::scene::{AmbientLight, Camera, CpuMesh, Light, LocalTransform, Spin, Time, Transform};
+use crate::scene::{
+    AmbientLight, Camera, CpuMesh, Light, LocalTransform, Spin, SsaoSettings, Time, Transform,
+};
 use crate::systems;
 use ferron_ecs::World;
 
@@ -69,6 +71,7 @@ impl App {
         app.world.insert_resource(Camera::default());
         app.world.insert_resource(Time::new());
         app.world.insert_resource(AmbientLight::default());
+        app.world.insert_resource(SsaoSettings::default());
 
         event_loop.run_app(&mut app).unwrap();
     }
@@ -286,7 +289,8 @@ impl ApplicationHandler for App {
                 let items = systems::extract_renderables(&self.world);
                 let lighting = systems::extract_lighting(&self.world);
                 let camera = *self.world.resource::<Camera>();
-                active.renderer.render(&items, &lighting, &camera);
+                let ssao = *self.world.resource::<SsaoSettings>();
+                active.renderer.render(&items, &lighting, &camera, &ssao);
 
                 // Average FPS over ~1s windows
                 self.fps_accum += delta;

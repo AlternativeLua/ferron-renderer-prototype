@@ -294,9 +294,12 @@ pub struct SsaoPass {
     nearest_clamp: Arc<Sampler>,
     nearest_repeat: Arc<Sampler>,
     noise_view: Arc<ImageView>,
+    /// 1x1 white (=1.0) AO view bound when SSAO is disabled, so the forward
+    /// shader samples "no occlusion" without a separate code path.
+    white_view: Arc<ImageView>,
     kernel: [[f32; 4]; KERNEL_MAX],
     targets: SsaoTargets,
-    // tweakables (wire to an ECS resource later)
+    // tweakables, driven by the `SsaoSettings` resource each frame.
     pub radius: f32,
     pub bias: f32,
     pub power: f32,
@@ -361,6 +364,7 @@ impl SsaoPass {
             nearest_clamp,
             nearest_repeat,
             noise_view: build_noise(ctx),
+            white_view: super::texture::upload_texture(ctx, &[255u8], [1, 1], AO_FORMAT),
             kernel: build_kernel(),
             targets,
             radius: 1.0,
@@ -377,6 +381,11 @@ impl SsaoPass {
     /// The blurred-AO view to bind into the forward pass this frame.
     pub fn ao_view(&self) -> Arc<ImageView> {
         self.targets.blur_ao_view.clone()
+    }
+
+    /// A 1x1 white (=1.0) view, bound when SSAO is disabled.
+    pub fn white_view(&self) -> Arc<ImageView> {
+        self.white_view.clone()
     }
 
     pub fn record(

@@ -1,6 +1,6 @@
 pub mod vulkan;
 
-use crate::scene::{Camera, CpuMesh, MaterialHandle, MeshHandle};
+use crate::scene::{Camera, CpuMesh, MaterialHandle, MeshHandle, SsaoSettings};
 use glam::{Mat4, Vec3};
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex as VertexTrait;
@@ -152,5 +152,11 @@ pub trait RenderBackend {
         srgb: bool,
     ) -> TextureHandle;
     fn resize(&mut self, extent: [u32; 2]);
-    fn render(&mut self, items: &[RenderItem], lighting: &SceneLighting, camera: &Camera);
+    fn render(
+        &mut self,
+        items: &[RenderItem],
+        lighting: &SceneLighting,
+        camera: &Camera,
+        ssao: &SsaoSettings,
+    );
 }
