@@ -14,6 +14,12 @@ pub struct Vertex {
     pub normal: [f32; 3],
     #[format(R32G32B32_SFLOAT)]
     pub color: [f32; 3],
+    #[format(R32G32_SFLOAT)]
+    pub uv: [f32; 2],
+    /// Object-space tangent (+U texture direction) in `xyz`; `w` is the
+    /// bitangent handedness (±1) used to rebuild the TBN basis for normal maps.
+    #[format(R32G32B32A32_SFLOAT)]
+    pub tangent: [f32; 4],
 }
 
 /// One thing to draw this frame: a mesh and the model matrix to draw it with.
@@ -30,6 +36,19 @@ pub struct RenderItem {
 }
 
 pub const MAX_POINT_LIGHTS: usize = 16;
+
+/// Size of the shader's bound texture array (set 2). Materials index into it by
+/// handle; unused slots are padded with a default texture. Keep at or below the
+/// device's `maxPerStageDescriptorSampledImages` (≥16 guaranteed; Apple/MoltenVK
+/// allows far more).
+pub const MAX_TEXTURES: usize = 64;
+
+/// A lightweight reference to a texture uploaded to the render backend.
+///
+/// Obtain one from [`RenderBackend::load_texture`]; store it on a [`Material`]
+/// to drive shading. The `u32` is the texture's index in the shader's array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TextureHandle(pub u32);
 
 /// A sun-like light: parallel rays with a single direction, no position.
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +99,10 @@ pub struct Material {
     pub roughness: f32,
     pub reflectance: f32,
     pub emissive: Vec3,
+    pub albedo_texture: Option<TextureHandle>,
+    pub normal_texture: Option<TextureHandle>,
+    pub metallic_roughness_texture: Option<TextureHandle>,
+    pub emissive_texture: Option<TextureHandle>,
 }
 
 impl Default for Material {
@@ -90,6 +113,10 @@ impl Default for Material {
             roughness: 0.5,
             reflectance: 0.5,
             emissive: Vec3::ZERO,
+            albedo_texture: None,
+            normal_texture: None,
+            metallic_roughness_texture: None,
+            emissive_texture: None,
         }
     }
 }
@@ -117,6 +144,13 @@ impl Default for SceneLighting {
 pub trait RenderBackend {
     fn load_mesh(&mut self, mesh: &CpuMesh) -> MeshHandle;
     fn load_material(&mut self, material: &Material) -> MaterialHandle;
+    fn load_texture(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        srgb: bool,
+    ) -> TextureHandle;
     fn resize(&mut self, extent: [u32; 2]);
     fn render(&mut self, items: &[RenderItem], lighting: &SceneLighting, camera: &Camera);
 }

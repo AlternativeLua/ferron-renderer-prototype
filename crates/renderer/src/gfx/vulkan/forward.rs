@@ -7,6 +7,7 @@ use vulkano::command_buffer::AutoCommandBufferBuilder;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
 use vulkano::format::Format;
+use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
@@ -23,7 +24,7 @@ use vulkano::pipeline::{
 };
 use vulkano::render_pass::{RenderPass, Subpass};
 
-use crate::gfx::{Material, RenderItem, SceneLighting, Vertex, MAX_POINT_LIGHTS};
+use crate::gfx::{Material, RenderItem, SceneLighting, Vertex, MAX_POINT_LIGHTS, MAX_TEXTURES};
 use crate::scene::Camera;
 
 use super::swapchain::DEPTH_FORMAT;
@@ -48,12 +49,18 @@ struct PushConstants {
     material_index: u32,
 }
 
+/// Default texture indices, matching the order `VulkanRenderer::new` seeds them.
+const WHITE_TEXTURE: u32 = 0;
+const FLAT_NORMAL_TEXTURE: u32 = 1;
+
 #[derive(vulkano::buffer::BufferContents, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct GpuMaterial {
     base_color: [f32; 4],
     emissive: [f32; 4],
     params: [f32; 4], // metallic, roughness, reflectance
+    /// Indices into the set-2 texture array: [albedo, normal, metal-rough, emissive].
+    tex_indices: [u32; 4],
 }
 
 /// Pack the engine's [`SceneLighting`] into the std140 layout the shader expects.
@@ -145,6 +152,8 @@ pub struct ForwardPass {
     uniform_buffer_allocator: SubbufferAllocator,
     /// Separate from the uniform one because usage flag differs
     storage_buffer_allocator: SubbufferAllocator,
+    /// Shared sampler used for every texture in the set-2 array.
+    sampler: Arc<Sampler>,
 }
 
 impl ForwardPass {
@@ -200,17 +209,24 @@ impl ForwardPass {
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
                 buffer_usage: BufferUsage::STORAGE_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE 
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             }
         );
+
+        let sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo::simple_repeat_linear_no_mipmap(),
+        )
+        .unwrap();
 
         Self {
             render_pass,
             pipeline,
             uniform_buffer_allocator,
             storage_buffer_allocator,
+            sampler,
         }
     }
 
@@ -260,7 +276,29 @@ impl ForwardPass {
             [WriteDescriptorSet::buffer(0, material_buffer)],
             []
         ).unwrap();
-        
+
+        // Bind every texture as one fixed-size array at set 2 (binding 0), plus a
+        // single shared sampler (binding 1). The shader's array must be fully
+        // populated, so pad unused slots with the default (white) view at index 0.
+        let default_view = renderer.textures[0].clone();
+        let texture_array = (0..MAX_TEXTURES).map(|i| {
+            renderer
+                .textures
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| default_view.clone())
+        });
+        let texture_set = DescriptorSet::new(
+            renderer.ctx.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[2].clone(),
+            [
+                WriteDescriptorSet::image_view_array(0, 0, texture_array),
+                WriteDescriptorSet::sampler(1, self.sampler.clone()),
+            ],
+            [],
+        )
+        .unwrap();
+
         builder
             .set_viewport(
                 0,
@@ -279,7 +317,7 @@ impl ForwardPass {
                 PipelineBindPoint::Graphics,
                 self.pipeline.layout().clone(),
                 0,
-                vec![lighting_set, material_set],
+                vec![lighting_set, material_set, texture_set],
             )
             .unwrap();
 
@@ -356,10 +394,18 @@ pub fn upload_mesh(
 }
 
 pub(super) fn to_gpu_material(m: &Material) -> GpuMaterial {
+    // Missing maps fall back to the default textures, which make the sample a
+    // no-op (white = ×1, flat normal = unchanged geometric normal).
     GpuMaterial {
         base_color: [m.base_color.x, m.base_color.y, m.base_color.z, 1.0],
-        emissive:   [m.emissive.x, m.emissive.y, m.emissive.z, 0.0],
-        params:     [m.metallic, m.roughness, m.reflectance, 0.0]
+        emissive: [m.emissive.x, m.emissive.y, m.emissive.z, 0.0],
+        params: [m.metallic, m.roughness, m.reflectance, 0.0],
+        tex_indices: [
+            m.albedo_texture.map_or(WHITE_TEXTURE, |h| h.0),
+            m.normal_texture.map_or(FLAT_NORMAL_TEXTURE, |h| h.0),
+            m.metallic_roughness_texture.map_or(WHITE_TEXTURE, |h| h.0),
+            m.emissive_texture.map_or(WHITE_TEXTURE, |h| h.0),
+        ],
     }
 }
 
@@ -431,10 +477,15 @@ mod vs {
             layout(location = 0) in vec3 position;
             layout(location = 1) in vec3 normal;
             layout(location = 2) in vec3 color;
+            layout(location = 3) in vec2 uv;
+            layout(location = 4) in vec4 tangent; // xyz = tangent, w = handedness
 
             layout(location = 0) out vec3 v_world_pos;
             layout(location = 1) out vec3 v_normal;
-            layout(location = 2) out vec3 v_color;
+            layout(location = 2) out vec3 v_tangent;
+            layout(location = 3) out vec3 v_bitangent;
+            layout(location = 4) out vec2 v_uv;
+            layout(location = 5) out vec3 v_color;
 
             // Declared identically to the fragment shader so the two stages
             // share one push-constant range. `material_index` is unused here.
@@ -448,7 +499,17 @@ mod vs {
             void main() {
                 vec4 world = push.model * vec4(position, 1.0);
                 v_world_pos = world.xyz;
-                v_normal = mat3(push.normal_matrix) * normal;
+
+                // World-space TBN basis for tangent-space normal mapping.
+                vec3 N = normalize(mat3(push.normal_matrix) * normal);
+                vec3 T = normalize(mat3(push.model) * tangent.xyz);
+                T = normalize(T - dot(T, N) * N);          // Gram-Schmidt
+                vec3 B = cross(N, T) * tangent.w;          // handedness from w
+
+                v_normal = N;
+                v_tangent = T;
+                v_bitangent = B;
+                v_uv = uv;
                 v_color = color;
                 gl_Position = push.mvp * vec4(position, 1.0);
             }
@@ -464,12 +525,16 @@ mod fs {
 
             layout(location = 0) in vec3 v_world_pos;
             layout(location = 1) in vec3 v_normal;
-            layout(location = 2) in vec3 v_color;
+            layout(location = 2) in vec3 v_tangent;
+            layout(location = 3) in vec3 v_bitangent;
+            layout(location = 4) in vec2 v_uv;
+            layout(location = 5) in vec3 v_color;
 
             layout(location = 0) out vec4 f_color;
 
-            // Keep in sync with MAX_POINT_LIGHTS in forward.rs.
+            // Keep in sync with MAX_POINT_LIGHTS / MAX_TEXTURES in forward.rs.
             const int MAX_POINT_LIGHTS = 16;
+            const int MAX_TEXTURES = 64;
             const float PI = 3.14159265359;
 
             struct PointLight {
@@ -487,11 +552,12 @@ mod fs {
             } lighting;
 
             // Mirrors GpuMaterial in forward.rs. std430 packs this exactly like
-            // the Rust #[repr(C)] struct because every field is a vec4.
+            // the Rust #[repr(C)] struct because every field is 16 bytes.
             struct GpuMaterial {
-                vec4 base_color; // rgb = albedo
-                vec4 emissive;   // rgb = emissive
-                vec4 params;     // x = metallic, y = roughness, z = reflectance
+                vec4 base_color;   // rgb = albedo
+                vec4 emissive;     // rgb = emissive
+                vec4 params;       // x = metallic, y = roughness, z = reflectance
+                uvec4 tex_indices; // x=albedo, y=normal, z=metal-rough, w=emissive
             };
 
             // Material table indexed by the per-draw material_index. A storage
@@ -499,6 +565,19 @@ mod fs {
             layout(set = 1, binding = 0, std430) readonly buffer Materials {
                 GpuMaterial materials[];
             };
+
+            // Textures are kept separate from the sampler: Metal/MoltenVK allows
+            // only 16 sampler states per stage but many sampled images, so a
+            // combined sampler2D[64] would blow the sampler limit. One shared
+            // sampler + an array of texture2D stays well under it.
+            layout(set = 2, binding = 0) uniform texture2D textures[MAX_TEXTURES];
+            layout(set = 2, binding = 1) uniform sampler tex_sampler;
+
+            // Index is dynamically uniform (from the material), so plain indexing
+            // is legal without the nonuniform qualifier.
+            vec4 sample_tex(uint index, vec2 uv) {
+                return texture(sampler2D(textures[index], tex_sampler), uv);
+            }
 
             // Declared identically to the vertex shader so the stages share one
             // push-constant range; only material_index is read here.
@@ -569,17 +648,29 @@ mod fs {
             void main() {
                 GpuMaterial m = materials[push.material_index];
 
+                // Sample the maps. Missing maps point at the default textures, so
+                // these multiplies become no-ops. Albedo/emissive images are sRGB
+                // (decoded to linear on sample); metal-rough is linear data.
+                vec3 albedo_tex = sample_tex(m.tex_indices.x, v_uv).rgb;
+                vec4 mr_tex     = sample_tex(m.tex_indices.z, v_uv);
+                vec3 emis_tex   = sample_tex(m.tex_indices.w, v_uv).rgb;
+
                 // Vertex color tints the material albedo; drop `* v_color` for a
-                // pure material color.
-                vec3  albedo      = m.base_color.rgb * v_color;
-                float metallic    = clamp(m.params.x, 0.0, 1.0);
-                float roughness   = clamp(m.params.y, 0.04, 1.0); // floor avoids a singular highlight
+                // pure material/texture color.
+                vec3  albedo      = m.base_color.rgb * v_color * albedo_tex;
+                // glTF metallic-roughness convention: G = roughness, B = metallic.
+                float metallic    = clamp(m.params.x * mr_tex.b, 0.0, 1.0);
+                float roughness   = clamp(m.params.y * mr_tex.g, 0.04, 1.0); // floor avoids a singular highlight
                 float reflectance = m.params.z;
 
                 // Dielectric F0 from reflectance (0.5 -> ~4%); metals use albedo as F0.
                 vec3 f0 = mix(vec3(0.16 * reflectance * reflectance), albedo, metallic);
 
-                vec3 N = normalize(v_normal);
+                // Tangent-space normal map -> world space via the TBN basis.
+                vec3 n_tangent = sample_tex(m.tex_indices.y, v_uv).xyz * 2.0 - 1.0;
+                mat3 TBN = mat3(normalize(v_tangent), normalize(v_bitangent), normalize(v_normal));
+                vec3 N = normalize(TBN * n_tangent);
+
                 vec3 V = normalize(lighting.camera_pos.xyz - v_world_pos);
 
                 // Crude diffuse ambient (stands in for image-based lighting).
@@ -606,7 +697,7 @@ mod fs {
                 }
 
                 // Emissive adds on top, unaffected by scene lighting.
-                color += m.emissive.rgb;
+                color += m.emissive.rgb * emis_tex;
 
                 f_color = vec4(color, 1.0);
             }

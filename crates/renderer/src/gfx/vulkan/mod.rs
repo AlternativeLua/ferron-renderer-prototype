@@ -1,6 +1,7 @@
 mod context;
 mod forward;
 mod swapchain;
+mod texture;
 
 use std::sync::Arc;
 
@@ -8,6 +9,8 @@ use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, RenderPassBeginInfo, SubpassBeginInfo,
     SubpassContents,
 };
+use vulkano::format::Format;
+use vulkano::image::view::ImageView;
 use vulkano::instance::Instance;
 use vulkano::swapchain::{
     acquire_next_image, Surface, SwapchainPresentInfo,
@@ -22,7 +25,7 @@ use self::context::VkContext;
 use self::forward::{ForwardPass, GpuMesh, GpuMaterial};
 use self::swapchain::SwapchainState;
 
-use super::{Material, RenderBackend, RenderItem, SceneLighting};
+use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
 
 type FrameFuture = FenceSignalFuture<Box<dyn GpuFuture>>;
 
@@ -32,6 +35,9 @@ pub struct VulkanRenderer {
     forward: ForwardPass,
     pub(crate) meshes: Vec<GpuMesh>,
     pub(crate) materials: Vec<GpuMaterial>,
+    /// Texture views indexed by `TextureHandle`. Index 0 is a 1x1 white texture
+    /// and index 1 a flat normal map; materials without a given map point here.
+    pub(crate) textures: Vec<Arc<ImageView>>,
     previous_frame_end: Option<FrameFuture>,
     recreate_swapchain: bool,
     pending_extent: [u32; 2],
@@ -44,12 +50,20 @@ impl VulkanRenderer {
         let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, format);
         let swapchain = SwapchainState::new(&ctx, &surface, &forward.render_pass, format, extent);
 
+        // Default textures so every material slot resolves to a valid view:
+        // index 0 = white (a no-op multiply), index 1 = flat normal (0,0,1).
+        let textures = vec![
+            texture::upload_texture(&ctx, &[255, 255, 255, 255], [1, 1], Format::R8G8B8A8_UNORM),
+            texture::upload_texture(&ctx, &[128, 128, 255, 255], [1, 1], Format::R8G8B8A8_UNORM),
+        ];
+
         Self {
             ctx,
             swapchain,
             forward,
             meshes: Vec::new(),
             materials: vec![forward::to_gpu_material(&Material::default())],
+            textures,
             previous_frame_end: None,
             recreate_swapchain: false,
             pending_extent: extent,
@@ -68,6 +82,26 @@ impl RenderBackend for VulkanRenderer {
     fn load_material(&mut self, material: &Material) -> MaterialHandle {
         let handle = MaterialHandle(self.materials.len() as u32);
         self.materials.push(forward::to_gpu_material(material));
+        handle
+    }
+
+    fn load_texture(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        srgb: bool,
+    ) -> TextureHandle {
+        // Color maps are authored in sRGB so the GPU decodes them to linear on
+        // sample; data maps (normal, metallic-roughness) are already linear.
+        let format = if srgb {
+            Format::R8G8B8A8_SRGB
+        } else {
+            Format::R8G8B8A8_UNORM
+        };
+        let view = texture::upload_texture(&self.ctx, pixels, [width, height], format);
+        let handle = TextureHandle(self.textures.len() as u32);
+        self.textures.push(view);
         handle
     }
 

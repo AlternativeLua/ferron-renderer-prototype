@@ -126,8 +126,54 @@ impl ApplicationHandler for App {
                 roughness: 0.85,
                 ..Material::default()
             },
+            // Neon
+            Material {
+                base_color: Vec3::splat(0.4),
+                metallic: 0.0,
+                roughness: 0.0,
+                reflectance: 0.0,
+                emissive: Vec3::new(1.0, 1.0, 1.0),
+                ..Material::default()
+            },
         ]
         .map(|material| renderer.load_material(&material));
+
+        // Procedural textures (raw RGBA, generated below) wired into one material.
+        // Swapping these for files only changes how the bytes are produced.
+        let tex = 256;
+        let albedo = renderer.load_texture(
+            &checkerboard(tex, 8, [220, 60, 50], [240, 240, 245]),
+            tex,
+            tex,
+            true, // color map: sRGB
+        );
+        let normal = renderer.load_texture(&bump_normals(tex, 6.0, 1.5), tex, tex, false);
+        let metal_rough = renderer.load_texture(&metallic_roughness(tex), tex, tex, false);
+        let textured = renderer.load_material(&Material {
+            base_color: Vec3::ONE,
+            metallic: 1.0,  // scaled by the metallic-roughness map
+            roughness: 1.0, // scaled by the metallic-roughness map
+            albedo_texture: Some(albedo),
+            normal_texture: Some(normal),
+            metallic_roughness_texture: Some(metal_rough),
+            ..Material::default()
+        });
+
+        let (px, w, h) = load_rgba(include_bytes!("assets/Rocks016_1K-JPG_Color.jpg"));
+        let rock_albedo = renderer.load_texture(&px, w, h, true);
+        let (px, w, h) = load_rgba(include_bytes!("assets/Rocks016_1K-JPG_NormalDX.jpg"));
+        let rock_normal = renderer.load_texture(&px, w, h, false);
+        let (px, w, h) = load_rgba(include_bytes!("assets/Rocks016_1K-JPG_Roughness.jpg"));
+        let rock_rough = renderer.load_texture(&px, w, h, false);
+        let rock = renderer.load_material(&Material {
+            base_color: Vec3::ONE,
+            metallic: 0.0,  // no metallic map; rock is a dielectric
+            roughness: 1.0, // driven by the roughness map (green channel)
+            albedo_texture: Some(rock_albedo),
+            normal_texture: Some(rock_normal),
+            metallic_roughness_texture: Some(rock_rough),
+            ..Material::default()
+        });
 
         let half = (GRID - 1) as f32 * SPACING * 0.5;
         for x in 0..GRID {
@@ -138,8 +184,13 @@ impl ApplicationHandler for App {
                 // Vary spin speed a little so the field isn't perfectly uniform.
                 let speed = 0.5 + ((x + z) % 5) as f32 * 0.4;
 
-                // Tile the palette across the grid so neighbours differ.
-                let material = materials[(x + z) as usize % materials.len()];
+                // Cycle the rock-textured, procedurally-textured, and solid
+                // palette materials across the grid.
+                let material = match (x + z) % 3 {
+                    0 => rock,
+                    1 => textured,
+                    _ => materials[(x + z) as usize % materials.len()],
+                };
 
                 let entity = self.world.spawn();
                 self.world.insert(entity, transform);
@@ -237,4 +288,62 @@ impl ApplicationHandler for App {
             active.window.request_redraw();
         }
     }
+}
+
+/// Decode an encoded image (PNG/JPG/…) into row-major RGBA8 + its dimensions,
+/// the form `RenderBackend::load_texture` expects.
+fn load_rgba(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
+    let img = image::load_from_memory(bytes)
+        .expect("failed to decode texture")
+        .to_rgba8();
+    let (width, height) = img.dimensions();
+    (img.into_raw(), width, height)
+}
+
+// --- Procedural textures -----------------------------------------------------
+
+/// Two-color checkerboard with `checks` cells per axis (a color/albedo map).
+fn checkerboard(size: u32, checks: u32, a: [u8; 3], b: [u8; 3]) -> Vec<u8> {
+    let cell = (size / checks).max(1);
+    let mut data = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let c = if ((x / cell) + (y / cell)).is_multiple_of(2) { a } else { b };
+            data.extend_from_slice(&[c[0], c[1], c[2], 255]);
+        }
+    }
+    data
+}
+
+/// Tangent-space normal map of a grid of rounded bumps, encoded as (n*0.5+0.5).
+fn bump_normals(size: u32, freq: f32, strength: f32) -> Vec<u8> {
+    let mut data = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let u = x as f32 / size as f32 * std::f32::consts::TAU * freq;
+            let v = y as f32 / size as f32 * std::f32::consts::TAU * freq;
+            // Slope is the gradient of the height field h = sin(u) * sin(v).
+            let dx = strength * u.cos() * v.sin();
+            let dy = strength * u.sin() * v.cos();
+            let n = Vec3::new(-dx, -dy, 1.0).normalize();
+            let e = (n * 0.5 + 0.5) * 255.0;
+            data.extend_from_slice(&[e.x as u8, e.y as u8, e.z as u8, 255]);
+        }
+    }
+    data
+}
+
+/// Metallic-roughness map (glTF convention: G = roughness, B = metallic).
+/// Roughness ramps left→right; metallic alternates in vertical bands.
+fn metallic_roughness(size: u32) -> Vec<u8> {
+    let band = (size / 8).max(1);
+    let mut data = Vec::with_capacity((size * size * 4) as usize);
+    for _ in 0..size {
+        for x in 0..size {
+            let roughness = (x * 255 / size.max(1)) as u8;
+            let metallic = if (x / band).is_multiple_of(2) { 255 } else { 0 };
+            data.extend_from_slice(&[0, roughness, metallic, 255]);
+        }
+    }
+    data
 }
