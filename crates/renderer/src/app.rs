@@ -200,6 +200,26 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Ground plane: a flattened cube the grid sits on, giving SSAO real
+        // contact surfaces to darken (the floating grid alone barely shows it).
+        let ground_material = renderer.load_material(&Material {
+            base_color: Vec3::splat(0.7),
+            metallic: 0.0,
+            roughness: 0.9,
+            ..Material::default()
+        });
+        let ground = self.world.spawn();
+        self.world.insert(
+            ground,
+            LocalTransform::from(Transform {
+                translation: Vec3::new(0.0, -0.75, 0.0),
+                scale: Vec3::new(GRID as f32 * SPACING * 1.5, 0.5, GRID as f32 * SPACING * 1.5),
+                ..Default::default()
+            }),
+        );
+        self.world.insert(ground, cube);
+        self.world.insert(ground, ground_material);
+
         // Lights are ordinary entities: a transform plus a `Light`. The sun's
         // direction comes from its rotation (forward = -Z); point lights sit at
         // their transform's translation.

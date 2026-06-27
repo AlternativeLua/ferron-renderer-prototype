@@ -2,6 +2,7 @@ mod context;
 mod forward;
 mod swapchain;
 mod texture;
+mod ssao;
 
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ use crate::scene::{Camera, CpuMesh, MaterialHandle, MeshHandle};
 use self::context::VkContext;
 use self::forward::{ForwardPass, GpuMesh, GpuMaterial};
 use self::swapchain::SwapchainState;
+use self::ssao::SsaoPass;
 
 use super::{Material, RenderBackend, RenderItem, SceneLighting, TextureHandle};
 
@@ -33,6 +35,7 @@ pub struct VulkanRenderer {
     pub(crate) ctx: VkContext,
     swapchain: SwapchainState,
     forward: ForwardPass,
+    ssao: SsaoPass,
     pub(crate) meshes: Vec<GpuMesh>,
     pub(crate) materials: Vec<GpuMaterial>,
     /// Texture views indexed by `TextureHandle`. Index 0 is a 1x1 white texture
@@ -48,6 +51,7 @@ impl VulkanRenderer {
         let ctx = VkContext::new(instance, &surface);
         let format = swapchain_color_format(&ctx, &surface);
         let forward = ForwardPass::new(&ctx.device, &ctx.memory_allocator, format);
+        let ssao = SsaoPass::new(&ctx, extent);
         let swapchain = SwapchainState::new(&ctx, &surface, &forward.render_pass, format, extent);
 
         // Default textures so every material slot resolves to a valid view:
@@ -61,6 +65,7 @@ impl VulkanRenderer {
             ctx,
             swapchain,
             forward,
+            ssao,
             meshes: Vec::new(),
             materials: vec![forward::to_gpu_material(&Material::default())],
             textures,
@@ -121,6 +126,7 @@ impl RenderBackend for VulkanRenderer {
                 &self.forward.render_pass,
                 self.pending_extent,
             ) {
+                self.ssao.resize(&self.ctx.memory_allocator, self.pending_extent);
                 self.recreate_swapchain = false;
             } else {
                 return;
@@ -149,6 +155,9 @@ impl RenderBackend for VulkanRenderer {
         )
         .unwrap();
 
+        self.ssao.record(&mut builder, self, items, camera, self.swapchain.extent);
+        let ao_view = self.ssao.ao_view();
+
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
@@ -175,6 +184,7 @@ impl RenderBackend for VulkanRenderer {
             lighting,
             camera,
             self.swapchain.extent,
+            ao_view
         );
 
         builder.end_render_pass(Default::default()).unwrap();

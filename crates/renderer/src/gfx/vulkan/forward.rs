@@ -7,7 +7,8 @@ use vulkano::command_buffer::AutoCommandBufferBuilder;
 use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
 use vulkano::device::Device;
 use vulkano::format::Format;
-use vulkano::image::sampler::{Sampler, SamplerCreateInfo};
+use vulkano::image::sampler::{Sampler, SamplerAddressMode, SamplerCreateInfo};
+use vulkano::image::view::ImageView;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
@@ -64,7 +65,8 @@ pub(crate) struct GpuMaterial {
 }
 
 /// Pack the engine's [`SceneLighting`] into the std140 layout the shader expects.
-fn to_gpu_lighting(lighting: &SceneLighting, camera_pos: Vec3) -> GpuLighting {
+fn to_gpu_lighting(lighting: &SceneLighting, camera_pos: Vec3, extent: [u32; 2]) -> GpuLighting {
+    let (w, h) = (extent[0] as f32, extent[1] as f32);
     let count = lighting.point_lights.len().min(MAX_POINT_LIGHTS);
     let mut point_lights = [GpuPointLight::ZERO; MAX_POINT_LIGHTS];
     for (slot, light) in point_lights
@@ -104,6 +106,7 @@ fn to_gpu_lighting(lighting: &SceneLighting, camera_pos: Vec3) -> GpuLighting {
             lighting.specular_strength,
             0.0,
         ],
+        viewport: [w, h, 1.0 / w, 1.0 / h],
         point_lights,
     }
 }
@@ -142,6 +145,8 @@ struct GpuLighting {
     sun_color: [f32; 4],
     /// x = point light count, y = shininess, z = specular strength.
     params: [f32; 4],
+    /// x=w, y=h, z=1/w, w=1/h
+    viewport: [f32; 4],
     point_lights: [GpuPointLight; MAX_POINT_LIGHTS],
 }
 
@@ -154,6 +159,7 @@ pub struct ForwardPass {
     storage_buffer_allocator: SubbufferAllocator,
     /// Shared sampler used for every texture in the set-2 array.
     sampler: Arc<Sampler>,
+    ao_sampler: Arc<Sampler>,
 }
 
 impl ForwardPass {
@@ -221,12 +227,21 @@ impl ForwardPass {
         )
         .unwrap();
 
+        let ao_sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                ..SamplerCreateInfo::simple_repeat_linear_no_mipmap()
+            },
+        ).unwrap();
+
         Self {
             render_pass,
             pipeline,
             uniform_buffer_allocator,
             storage_buffer_allocator,
             sampler,
+            ao_sampler
         }
     }
 
@@ -240,6 +255,7 @@ impl ForwardPass {
         lighting: &SceneLighting,
         camera: &Camera,
         extent: [u32; 2],
+        ao_view: Arc<ImageView>,
     ) {
         let aspect = extent[0] as f32 / extent[1] as f32;
         let view_proj = camera.view_projection(aspect);
@@ -250,7 +266,7 @@ impl ForwardPass {
             .uniform_buffer_allocator
             .allocate_sized::<GpuLighting>()
             .unwrap();
-        *lighting_buffer.write().unwrap() = to_gpu_lighting(lighting, camera.position);
+        *lighting_buffer.write().unwrap() = to_gpu_lighting(lighting, camera.position, extent);
 
         let lighting_set = DescriptorSet::new(
             renderer.ctx.descriptor_set_allocator.clone(),
@@ -259,6 +275,13 @@ impl ForwardPass {
             [],
         )
         .unwrap();
+
+        let ao_set = DescriptorSet::new(
+            renderer.ctx.descriptor_set_allocator.clone(),
+            self.pipeline.layout().set_layouts()[3].clone(),
+            [WriteDescriptorSet::image_view_sampler(0, ao_view, self.ao_sampler.clone())],
+            [],
+        ).unwrap();
         
         // Copy the table into a fresh storage buffer and bind as set 1
         let material_buffer = self
@@ -317,7 +340,7 @@ impl ForwardPass {
                 PipelineBindPoint::Graphics,
                 self.pipeline.layout().clone(),
                 0,
-                vec![lighting_set, material_set, texture_set],
+                vec![lighting_set, material_set, texture_set, ao_set],
             )
             .unwrap();
 
@@ -548,6 +571,7 @@ mod fs {
                 vec4 sun_direction; // xyz = direction toward the sun (normalized)
                 vec4 sun_color;     // rgb = color, w = intensity
                 vec4 params;        // x = point light count (y,z legacy, unused by PBR)
+                vec4 viewport;      // x=w, y=h, z=1/w, w=1/h
                 PointLight point_lights[MAX_POINT_LIGHTS];
             } lighting;
 
@@ -572,6 +596,9 @@ mod fs {
             // sampler + an array of texture2D stays well under it.
             layout(set = 2, binding = 0) uniform texture2D textures[MAX_TEXTURES];
             layout(set = 2, binding = 1) uniform sampler tex_sampler;
+
+            // Screen-space ambient occlusion (blurred), sampled by screen-space UV.
+            layout(set = 3, binding = 0) uniform sampler2D u_ao;
 
             // Index is dynamically uniform (from the material), so plain indexing
             // is legal without the nonuniform qualifier.
@@ -673,8 +700,10 @@ mod fs {
 
                 vec3 V = normalize(lighting.camera_pos.xyz - v_world_pos);
 
-                // Crude diffuse ambient (stands in for image-based lighting).
-                vec3 color = lighting.ambient.rgb * lighting.ambient.w * albedo;
+                // Crude diffuse ambient (stands in for image-based lighting),
+                // attenuated by screen-space ambient occlusion.
+                float ao = texture(u_ao, gl_FragCoord.xy * lighting.viewport.zw).r;
+                vec3 color = lighting.ambient.rgb * lighting.ambient.w * albedo * ao;
 
                 // Directional sun.
                 {
